@@ -1,0 +1,38 @@
+<html>
+
+<head>
+    <title>Search</title>
+</head>
+
+<body>
+    <form name="search_form" onsubmit="return false;">
+        <div>
+            <span>Number of years: </span>
+            <input type="number" id="num_of_years" name="num_of_years" value="">
+        </div>
+        <input type="submit" id="search_btn" value="Search">
+        <div>
+            <span>Number of records: </span>
+            <span id="result_lbl"></span>
+        </div>
+    </form>
+
+    <script src="/axios.min.js"></script>
+    <script>
+        (function () {
+            var output = document.getElementById('result_lbl');
+            document.getElementById('search_btn').onclick = function () {
+                var data = document.getElementById('num_of_years').value;
+                axios.post('/search', { 'num_of_years': data })
+                    .then(function (res) {
+                        output.innerText = res.data;
+                    })
+                    .catch(function (err) {
+                        output.innerText = err.message;
+                    });
+            };
+        })();
+    </script>
+</body>
+
+</html>

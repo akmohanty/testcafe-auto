@@ -1,0 +1,1 @@
+sudo docker build -t testcafe-provisioner:1.0.0 .

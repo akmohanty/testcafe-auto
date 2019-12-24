@@ -1,0 +1,461 @@
+puts Time.now.strftime('%Y_%m_%d-%H_%M_%S_%N')
+
+vagrant_root = File.dirname(__FILE__)
+
+cluster = {
+  "selenium-hub" => { :ip => "192.168.0.24", :cpus => 2, :mem => 8192 },
+  # "selenium-node" => { :ip => "192.168.0.22", :cpus => 2, :mem => 2048 },
+  # "worker-blue1" => { :ip => "192.168.0.23", :cpus => 2, :mem => 2048 }
+}
+
+$script_install_Docker_K8S = <<-SCRIPT
+# export DEBIAN_FRONTEND=noninteractive
+sudo -i
+
+
+sudo swapoff -a
+
+
+update-alternatives --set iptables /usr/sbin/iptables-legacy
+update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+update-alternatives --set arptables /usr/sbin/arptables-legacy
+update-alternatives --set ebtables /usr/sbin/ebtables-legacy
+
+sudo apt-get update && sudo dpkg-reconfigure libc6 && export DEBIAN_FRONTEND=noninteractive && sudo apt-get install -qq apt-transport-https curl
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+cat <<TAG | sudo tee /etc/apt/sources.list.d/kubernetes.list
+deb https://apt.kubernetes.io/ kubernetes-xenial main
+TAG
+
+sudo apt-get update && sudo dpkg-reconfigure libc6 && export DEBIAN_FRONTEND=noninteractive && sudo apt-get install -qq kubelet kubeadm kubectl
+sudo apt-mark hold kubelet kubeadm kubectl
+sudo systemctl daemon-reload
+sudo systemctl restart kubelet
+
+cat > /etc/modules-load.d/containerd.conf <<EOF
+overlay
+br_netfilter
+EOF
+modprobe overlay
+modprobe br_netfilter
+cat > /etc/sysctl.d/99-kubernetes-cri.conf <<EOF
+net.bridge.bridge-nf-call-iptables  = 1
+net.ipv4.ip_forward                 = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+EOF
+sysctl --system
+apt-get update && dpkg-reconfigure libc6 && export DEBIAN_FRONTEND=noninteractive && apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+add-apt-repository \
+  "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
+  $(lsb_release -cs) \
+  stable"
+apt-get update && dpkg-reconfigure libc6 && export DEBIAN_FRONTEND=noninteractive && apt-get install -y docker-ce=18.06.2~ce~3-0~ubuntu containerd.io
+cat > /etc/docker/daemon.json <<EOF
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
+mkdir -p /etc/systemd/system/docker.service.d
+systemctl daemon-reload
+systemctl restart docker
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+systemctl restart containerd
+
+#todo: Remove
+kubeadm config images pull
+echo '############################# basic installation complete #############################'
+SCRIPT
+
+Vagrant.configure("2") do |config|
+  cluster.each_with_index do |(hostname, info), index|
+
+    config.vm.define hostname do |cfg|
+
+      cfg.ssh.forward_agent = true
+      cfg.ssh.insert_key = false # 1
+      cfg.ssh.private_key_path = ['~/.vagrant.d/insecure_private_key', '~/.ssh/id_rsa'] # 2
+
+      # Remove old ssh pub cert
+      cfg.trigger.before :up do |trigger|
+        trigger.info = "Clean up old key"
+        trigger.run = {inline: "bash -c 'ssh-keygen -f /home/amiya/.ssh/known_hosts -R #{info[:ip]}'"}
+      end
+
+      cfg.vm.provider :virtualbox do |vb, override|
+        cfg.vm.box = "ubuntu/xenial64"
+        # cfg.vm.box = "bento/ubuntu-18.04"
+        # cfg.vm.box = "k8s-common"
+        override.vm.network :private_network, ip: "#{info[:ip]}"
+        vb.customize ["modifyvm", :id, "--memory", info[:mem], "--cpus", info[:cpus], "--hwvirtex", "on"]
+        vb.name = hostname
+        override.vm.hostname = hostname
+      end # end provider
+
+      # Set up ssh
+      cfg.vm.provision "file", source: "~/.ssh/id_rsa.pub", destination: "~/.ssh/authorized_keys" # 3
+      cfg.vm.provision "shell", inline: <<-EOC
+        sudo sed -i -e "\\#PasswordAuthentication yes# s#PasswordAuthentication yes#PasswordAuthentication no#g" /etc/ssh/sshd_config
+        sudo systemctl restart sshd.service
+        echo "finished ssh setup in #{info[:ip]}"
+      EOC
+
+      # #Install Docker and K8S
+      cfg.vm.provision "shell", inline: $script_install_Docker_K8S
+
+
+      if hostname == "selenium-hub"
+        # Provisioning for Admin Node
+	      # ts=Time.now.strftime('%Y_%m_%d-%H_%M_%S_%N')
+        #Complete Kubeadm installation
+        cfg.vm.provision "shell", inline:<<-SCRIPT
+          sudo kubeadm init --apiserver-advertise-address=#{info[:ip]} --apiserver-bind-port=6443 --cert-dir=/etc/kubernetes/pki --control-plane-endpoint=#{info[:ip]} --cri-socket= --image-repository=k8s.gcr.io --kubernetes-version=stable-1 --node-name=#{info[:ip]} --pod-network-cidr=10.244.0.0/16 --service-cidr=10.96.0.0/12 --service-dns-domain=cluster.local --token=abcdef.0123456789abcdef --token-ttl=24h0m0s
+          mkdir -p $HOME/.kube 
+          sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+          sudo chown $(id -u):$(id -g) $HOME/.kube/config
+          sudo sysctl net.bridge.bridge-nf-call-iptables=1
+          kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/2140ac876ef134e0ed5af15c65e414cf26827915/Documentation/kube-flannel.yml
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.0.0-beta6/aio/deploy/recommended.yaml
+          sudo mkdir -p /etc/kubernetes/addons/
+          sudo cat > /etc/kubernetes/addons/ingress-configmap.yaml <<"EOF"
+apiVersion: v1
+data:
+  # see https://github.com/kubernetes/ingress-nginx/blob/master/docs/user-guide/nginx-configuration/configmap.md for all possible options and their description
+  map-hash-bucket-size: "128"
+  hsts: "false"
+kind: ConfigMap
+metadata:
+  name: nginx-load-balancer-conf
+  namespace: kube-system
+  labels:
+    addonmanager.kubernetes.io/mode: EnsureExists
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tcp-services
+  namespace: kube-system
+  labels:
+    addonmanager.kubernetes.io/mode: EnsureExists
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: udp-services
+  namespace: kube-system
+  labels:
+    addonmanager.kubernetes.io/mode: EnsureExists
+EOF
+
+          sudo cat > /etc/kubernetes/addons/ingress-rbac.yaml <<"EOF"
+---
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nginx-ingress
+  namespace: kube-system
+  labels:
+    addonmanager.kubernetes.io/mode: Reconcile
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRole
+metadata:
+  name: system:nginx-ingress
+  labels:
+    kubernetes.io/bootstrapping: rbac-defaults
+    addonmanager.kubernetes.io/mode: Reconcile
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - endpoints
+  - nodes
+  - pods
+  - secrets
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - "extensions"
+  - "networking.k8s.io"
+  resources:
+  - ingresses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - "extensions"
+  - "networking.k8s.io"
+  resources:
+  - ingresses/status
+  verbs:
+  - update
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: Role
+metadata:
+  name: system::nginx-ingress-role
+  namespace: kube-system
+  labels:
+    kubernetes.io/bootstrapping: rbac-defaults
+    addonmanager.kubernetes.io/mode: Reconcile
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - pods
+  - secrets
+  - namespaces
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  resourceNames:
+  # Defaults to "<election-id>-<ingress-class>"
+  # Here: "<ingress-controller-leader>-<nginx>"
+  # This has to be adapted if you change either parameter
+  # when launching the nginx-ingress-controller.
+  - ingress-controller-leader-nginx
+  verbs:
+  - get
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - endpoints
+  verbs:
+  - get
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: RoleBinding
+metadata:
+  name: system::nginx-ingress-role-binding
+  namespace: kube-system
+  labels:
+    kubernetes.io/bootstrapping: rbac-defaults
+    addonmanager.kubernetes.io/mode: EnsureExists
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: system::nginx-ingress-role
+subjects:
+- kind: ServiceAccount
+  name: nginx-ingress
+  namespace: kube-system
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: system:nginx-ingress
+  labels:
+    kubernetes.io/bootstrapping: rbac-defaults
+    addonmanager.kubernetes.io/mode: EnsureExists
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:nginx-ingress
+subjects:
+- kind: ServiceAccount
+  name: nginx-ingress
+  namespace: kube-system
+EOF
+
+          sudo cat > /etc/kubernetes/addons/ingress-dp.yaml <<"EOF"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-ingress-controller
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: nginx-ingress-controller
+    app.kubernetes.io/part-of: kube-system
+    addonmanager.kubernetes.io/mode: Reconcile
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable needs to be 1 so that port conflicts between the old and new pod doesn't happen when using hostPort
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nginx-ingress-controller
+      app.kubernetes.io/part-of: kube-system
+      addonmanager.kubernetes.io/mode: Reconcile
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nginx-ingress-controller
+        app.kubernetes.io/part-of: kube-system
+        addonmanager.kubernetes.io/mode: Reconcile
+      annotations:
+        prometheus.io/port: '10254'
+        prometheus.io/scrape: 'true'
+    spec:
+      serviceAccountName: nginx-ingress
+      terminationGracePeriodSeconds: 60
+      containers:
+      - image: quay.io/kubernetes-ingress-controller/nginx-ingress-controller:0.26.1
+        name: nginx-ingress-controller
+        imagePullPolicy: IfNotPresent
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 10254
+            scheme: HTTP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 10254
+            scheme: HTTP
+          initialDelaySeconds: 10
+          timeoutSeconds: 5
+        env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+        ports:
+        - containerPort: 80
+          hostPort: 80
+        - containerPort: 443
+          hostPort: 443
+        # (Optional) we expose 18080 to access nginx stats in url /nginx-status
+        - containerPort: 18080
+          hostPort: 18080
+        args:
+        - /nginx-ingress-controller
+        - --configmap=$(POD_NAMESPACE)/nginx-load-balancer-conf
+        - --tcp-services-configmap=$(POD_NAMESPACE)/tcp-services
+        - --udp-services-configmap=$(POD_NAMESPACE)/udp-services
+        - --annotations-prefix=nginx.ingress.kubernetes.io
+        # use minikube IP address in ingress status field
+        - --report-node-internal-ip-address
+        securityContext:
+          capabilities:
+              drop:
+              - ALL
+              add:
+              - NET_BIND_SERVICE
+          # www-data -> 33
+          runAsUser: 33
+EOF
+          kubectl apply -f /etc/kubernetes/addons/ingress-configmap.yaml
+          kubectl apply -f /etc/kubernetes/addons/ingress-rbac.yaml
+          kubectl apply -f /etc/kubernetes/addons/ingress-dp.yaml
+        SCRIPT
+
+        cfg.trigger.after :up do |trigger|
+          trigger.info = "Copy admin.conf from Master"
+          trigger.run = { inline: "ssh vagrant@#{info[:ip]} -o StrictHostKeyChecking=no 'sudo cp /etc/kubernetes/admin.conf $HOME/ && sudo chown vagrant $HOME/admin.conf && sudo kubeadm token create --print-join-command > $HOME/join_cmd.sh'" }
+        end
+        cfg.trigger.after :up do |trigger|
+          trigger.info = "Copy admin.conf from Master2"
+          trigger.run = { inline: "scp -o StrictHostKeyChecking=no vagrant@#{info[:ip]}:{admin.conf,join_cmd.sh} #{vagrant_root}" }
+        end
+        cfg.trigger.after :up do |trigger|
+          trigger.info = "Copy admin.conf from Master3"
+          trigger.run = { inline: "ssh vagrant@#{info[:ip]} -o StrictHostKeyChecking=no 'rm -f admin.conf && rm -f join_cmd.sh'" }
+        end
+        cfg.trigger.after :up do |trigger|
+          trigger.info = "Copy admin.conf from Master4"
+          trigger.run = { inline: "mv -f admin.conf config" }
+        end
+        cfg.trigger.after :up do |trigger|
+          trigger.info = "End Master5"
+          trigger.run = { inline: "date" }
+        end
+
+      elsif
+
+
+
+        cfg.trigger.after :up do |trigger|
+          trigger.info = "Join worker1 node #{info[:ip]} script"
+          trigger.run = { inline: "ssh vagrant@#{info[:ip]} -o StrictHostKeyChecking=no 'mkdir -p $HOME/.kube'" }
+        end
+        cfg.trigger.after :up do |trigger|
+          trigger.info = "Join worker1 node #{info[:ip]} script2"
+          trigger.run = { inline: "scp -o StrictHostKeyChecking=no #{vagrant_root}/config vagrant@#{info[:ip]}:$HOME/.kube" }
+        end
+        cfg.trigger.after :up do |trigger|
+          trigger.info = "Join worker1 node #{info[:ip]} script2"
+          trigger.run = { inline: "scp -o StrictHostKeyChecking=no #{vagrant_root}/join_cmd.sh vagrant@#{info[:ip]}:." }
+        end
+        cfg.trigger.after :up do |trigger|
+          trigger.info = "Join worker1 node #{info[:ip]} script3"
+          trigger.run = { inline: "ssh vagrant@#{info[:ip]} -o StrictHostKeyChecking=no 'sudo chown $(id -u):$(id -g) $HOME/.kube/config && sudo bash $HOME/join_cmd.sh'" }
+        end
+        cfg.trigger.after :up do |trigger|
+          trigger.info = "End #{info[:ip]} script4"
+          trigger.run = { inline: "date" }
+        end
+
+
+      end
+
+      
+
+
+
+
+
+
+    end
+  end
+end
+
+

@@ -1,0 +1,22 @@
+{
+  "name": "selenium-client",
+  "version": "1.0.0",
+  "description": "",
+  "main": "app.js",
+  "scripts": {
+    "start-prod": "node app.js",
+    "test": "SELENIUM_GRID=192.168.0.24 node tc-auto/tc-runner.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "ip": "^1.1.5",
+    "mathjs": "^6.2.5",
+    "openssl-self-signed-certificate": "^1.1.6",
+    "testcafe": "^1.7.0"
+  },
+  "dependencies": {
+    "body-parser": "^1.19.0",
+    "express": "^4.17.1"
+  }
+}
