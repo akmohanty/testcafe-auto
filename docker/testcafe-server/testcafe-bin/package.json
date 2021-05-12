@@ -10,7 +10,7 @@
   "license": "ISC",
   "devDependencies": {
     "ip": "^1.1.5",
-    "mathjs": "^6.2.5",
+    "mathjs": "^7.5.1",
     "openssl-self-signed-certificate": "^1.1.6",
     "testcafe": "^1.7.0"
   },
